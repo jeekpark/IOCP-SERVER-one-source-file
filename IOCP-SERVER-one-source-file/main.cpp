@@ -65,19 +65,139 @@ static SOCKET CreateServerSocket(int port)
     return listenSocket;
 }
 
+static HANDLE CreateIOCP()
+{
+    HANDLE iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (iocp == NULL)
+    {
+        std::cerr << "5. Failed to create IOCP." << std::endl;
+    }
+    else
+    {
+        std::cout << "5. IOCP created." << std::endl;
+    }
+    return iocp;
+}
+
+static bool AssociateSocketWithIOCP(HANDLE iocp, SOCKET socket, ULONG_PTR completionKey)
+{
+    HANDLE result = CreateIoCompletionPort((HANDLE)socket, iocp, completionKey, 0);
+    if (result == NULL)
+    {
+        std::cerr << "Failed to associate socket with IOCP." << std::endl;
+        return false;
+    }
+    return true;
+}
+
+struct ClientContext
+{
+    SOCKET socket;
+    WSAOVERLAPPED overlapped;
+    WSABUF buffer;
+    char dataBuffer[1024];
+    DWORD bytesReceived;
+};
+
+static bool ReceiveData(ClientContext* clientContext)
+{
+    ZeroMemory(&clientContext->overlapped, sizeof(WSAOVERLAPPED));
+    clientContext->buffer.buf = clientContext->dataBuffer;
+    clientContext->buffer.len = sizeof(clientContext->dataBuffer);
+
+    DWORD flags = 0;
+    int result = WSARecv(clientContext->socket, &clientContext->buffer, 1, NULL, &flags, &clientContext->overlapped, NULL);
+
+    if (result == SOCKET_ERROR) {
+        if (WSAGetLastError() != WSA_IO_PENDING) {
+            std::cerr << "WSARecv failed." << std::endl;
+            return false;
+        }
+    }
+    return true;
+}
+
+static void WorkerThread(HANDLE iocp)
+{
+    DWORD bytesTransferred;
+    ClientContext* clientContext{};
+    LPOVERLAPPED overlapped;
+
+    while (true)
+    {
+        BOOL result = GetQueuedCompletionStatus(iocp, &bytesTransferred, (PULONG_PTR)&clientContext, &overlapped, INFINITE);
+        if (result == FALSE || bytesTransferred == 0)
+        {
+            std::cerr << "Client disconnected." << std::endl;
+            closesocket(clientContext->socket);
+            delete clientContext;
+            continue;
+        }
+        std::cout << "Received data: " << clientContext->dataBuffer << std::endl;
+        ReceiveData(clientContext);
+    }
+}
+
+
+
 int main() 
 {
-    if (!InitializeWinsock()) 
+    if (InitializeWinsock() == false)
     {
         return 1;
     }
 
     SOCKET serverSocket = CreateServerSocket(8080);
-    if (serverSocket == INVALID_SOCKET) 
+    if (serverSocket == INVALID_SOCKET)
     {
         WSACleanup();
         return 1;
     }
 
+    HANDLE iocp = CreateIOCP();
+    if (iocp == NULL)
+    {
+        closesocket(serverSocket);
+        WSACleanup();
+        return 1;
+    }
+
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i)
+    { 
+        workers.push_back(std::thread(WorkerThread, iocp));
+    }
+
+    while (true)
+    {
+        SOCKET clientSocket = accept(serverSocket, NULL, NULL);
+        if (clientSocket == INVALID_SOCKET)
+        {
+            std::cerr << "Accept failed." << std::endl;
+            break;
+        }
+        else
+        {
+            std::cout << "Client connected." << std::endl;
+        }   
+        ClientContext* clientContext = new ClientContext;
+        clientContext->socket = clientSocket;
+
+        if (!AssociateSocketWithIOCP(iocp, clientSocket, (ULONG_PTR)clientContext))
+        {
+            closesocket(clientSocket);
+            delete clientContext;
+            continue;
+        }
+        ReceiveData(clientContext);
+    }
+
+    for (auto& worker : workers)
+    {
+        worker.join();
+    }
+
+    closesocket(serverSocket);
+    WSACleanup();
     return 0;
 }
